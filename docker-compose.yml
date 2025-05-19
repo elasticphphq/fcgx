@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  php-fpm:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ./docker/php:/var/www/html:ro
+    environment:
+      - PHP_FPM_LISTEN=9000
+      - PHP_FPM_USER=www-data
+      - PHP_FPM_GROUP=www-data
+    healthcheck:
+      test: ["CMD", "php-fpm", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
