@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -414,6 +415,34 @@ func Dial(network, address string) (*Client, error) {
 		return nil, wrap(err, ErrConnect, "dialing connection")
 	}
 	return &Client{conn: conn, reqID: 1}, nil
+}
+
+// ReadBody reads and returns the actual response body as a []byte.
+// It also strips any HTTP headers if present (as in FastCGI/PHP-FPM responses).
+// It closes the response body after reading.
+func ReadBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	all, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	// Look for double CRLF (end of headers)
+	if idx := bytes.Index(all, []byte("\r\n\r\n")); idx != -1 {
+		return all[idx+4:], nil
+	}
+	// If not found, return all
+	return all, nil
+}
+
+// ReadJSON reads and unmarshals the actual response body as JSON into out.
+// It also strips any HTTP headers if present (as in FastCGI/PHP-FPM responses).
+// It closes the response body after reading.
+func ReadJSON(resp *http.Response, out any) error {
+	b, err := ReadBody(resp)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
 }
 
 // DialContext establishes a connection to the FastCGI server at the specified network address

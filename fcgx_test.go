@@ -3,7 +3,6 @@ package fcgx
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"strings"
@@ -67,13 +66,13 @@ func TestFCGXIntegration(t *testing.T) {
 			t.Errorf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		body, err := ReadBody(resp)
 		if err != nil {
-			t.Fatalf("Failed to read response body: %v", err)
+			t.Fatalf("ReadBody failed: %v", err)
 		}
 
-		if !strings.Contains(string(respBody), "-PASSED-") {
-			t.Errorf("Expected response to contain '-PASSED-', got: %s", string(respBody))
+		if !strings.Contains(string(body), "-PASSED-") {
+			t.Errorf("Expected response to contain '-PASSED-', got: %s", string(body))
 		}
 	})
 
@@ -110,13 +109,116 @@ func TestFCGXIntegration(t *testing.T) {
 			t.Errorf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		body, err := ReadBody(resp)
 		if err != nil {
-			t.Fatalf("Failed to read response body: %v", err)
+			t.Fatalf("ReadBody failed: %v", err)
 		}
 
-		if !strings.Contains(string(respBody), "-PASSED-") {
-			t.Errorf("Expected response to contain '-PASSED-', got: %s", string(respBody))
+		if !strings.Contains(string(body), "-PASSED-") {
+			t.Errorf("Expected response to contain '-PASSED-', got: %s", string(body))
+		}
+	})
+
+	t.Run("ReadJSONSuccess", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		client, err := DialContext(ctx, "tcp", testAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to PHP-FPM: %v", err)
+		}
+		defer client.Close()
+
+		params := map[string]string{
+			"SCRIPT_FILENAME": "/var/www/html/json.php",
+			"SCRIPT_NAME":     "/json.php",
+			"SERVER_PORT":     "80",
+			"SERVER_PROTOCOL": "HTTP/1.1",
+			"REQUEST_URI":     "/json.php",
+			"SERVER_NAME":     "localhost",
+		}
+
+		resp, err := client.Get(ctx, params)
+		if err != nil {
+			t.Fatalf("GET failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		var dst struct {
+			Status string `json:"status"`
+			Pass   bool   `json:"pass"`
+		}
+		err = ReadJSON(resp, &dst)
+		if err != nil {
+			t.Fatalf("ReadJSON failed: %v", err)
+		}
+		if dst.Status != "ok" || !dst.Pass {
+			t.Errorf("Unexpected JSON content: %+v", dst)
+		}
+	})
+
+	t.Run("ReadJSONWrongContentType", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		client, err := DialContext(ctx, "tcp", testAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to PHP-FPM: %v", err)
+		}
+		defer client.Close()
+
+		params := map[string]string{
+			"SCRIPT_FILENAME": "/var/www/html/get.php",
+			"SCRIPT_NAME":     "/get.php",
+			"SERVER_PORT":     "80",
+			"SERVER_PROTOCOL": "HTTP/1.1",
+			"REQUEST_URI":     "/get.php",
+			"SERVER_NAME":     "localhost",
+		}
+
+		resp, err := client.Get(ctx, params)
+		if err != nil {
+			t.Fatalf("GET failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		var dst interface{}
+		err = ReadJSON(resp, &dst)
+		if err == nil {
+			t.Error("Expected error due to wrong Content-Type, got nil")
+		}
+	})
+
+	t.Run("ReadJSONMalformed", func(t *testing.T) {
+		// This test assumes /malformed_json.php returns Content-Type application/json but invalid JSON
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		client, err := DialContext(ctx, "tcp", testAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to PHP-FPM: %v", err)
+		}
+		defer client.Close()
+
+		params := map[string]string{
+			"SCRIPT_FILENAME": "/var/www/html/malformed_json.php",
+			"SCRIPT_NAME":     "/malformed_json.php",
+			"SERVER_PORT":     "80",
+			"SERVER_PROTOCOL": "HTTP/1.1",
+			"REQUEST_URI":     "/malformed_json.php",
+			"SERVER_NAME":     "localhost",
+		}
+
+		resp, err := client.Get(ctx, params)
+		if err != nil {
+			t.Fatalf("GET failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		var dst interface{}
+		err = ReadJSON(resp, &dst)
+		if err == nil {
+			t.Error("Expected error due to malformed JSON, got nil")
 		}
 	})
 
@@ -194,7 +296,7 @@ func TestFCGXIntegration(t *testing.T) {
 				cancel()
 			}()
 
-			_, err = io.ReadAll(resp.Body)
+			_, err = ReadBody(resp)
 			if err == nil {
 				t.Log("No error: operation completed before context expired")
 			} else if !errors.Is(err, ErrContextCancelled) && !errors.Is(err, ErrTimeout) {
@@ -275,7 +377,7 @@ func TestFCGXIntegration(t *testing.T) {
 
 			done := make(chan error, 1)
 			go func() {
-				_, err := io.ReadAll(resp.Body)
+				_, err := ReadBody(resp)
 				done <- err
 			}()
 
