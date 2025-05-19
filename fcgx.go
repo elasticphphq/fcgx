@@ -18,6 +18,31 @@ import (
 	"time"
 )
 
+var (
+	ErrClientClosed     = errors.New("fcgx: client closed")
+	ErrTimeout          = errors.New("fcgx: timeout")
+	ErrContextCancelled = errors.New("fcgx: context cancelled")
+	ErrUnexpectedEOF    = errors.New("fcgx: unexpected EOF")
+	ErrInvalidResponse  = errors.New("fcgx: invalid response")
+	ErrPHPFPM           = errors.New("fcgx: php-fpm error")
+	ErrConnect          = errors.New("fcgx: connect error")
+	ErrWrite            = errors.New("fcgx: write error")
+	ErrRead             = errors.New("fcgx: read error")
+)
+
+func wrap(err, kind error, msg string) error {
+	return fmt.Errorf("%w: %s: %v", kind, msg, err)
+}
+func isTimeout(err error) bool {
+	return errors.Is(err, ErrTimeout) ||
+		strings.Contains(err.Error(), "timeout") ||
+		strings.Contains(err.Error(), "deadline exceeded") ||
+		(strings.Contains(err.Error(), "i/o timeout"))
+}
+func isEOF(err error) bool {
+	return errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF")
+}
+
 const (
 	FCGI_HEADER_LEN     = 8
 	fcgiVersion1        = 1
@@ -69,7 +94,7 @@ func (c *Client) writeRecord(recType uint8, content []byte) error {
 	}
 
 	if err := binary.Write(&c.buf, binary.BigEndian, h); err != nil {
-		return fmt.Errorf("writing record header: %w", err)
+		return wrap(err, ErrWrite, "writing record header")
 	}
 
 	if contentLen > 0 {
@@ -82,10 +107,10 @@ func (c *Client) writeRecord(recType uint8, content []byte) error {
 
 	_, err := c.conn.Write(c.buf.Bytes())
 	if err != nil {
-		if err, ok := err.(net.Error); ok && err.Timeout() {
-			return fmt.Errorf("timeout while writing record: %w", err)
+		if isTimeout(err) {
+			return wrap(err, ErrTimeout, "timeout while writing record")
 		}
-		return fmt.Errorf("writing record: %w", err)
+		return wrap(err, ErrWrite, "writing record")
 	}
 	return nil
 }
@@ -121,13 +146,13 @@ func (c *Client) writePairs(recType uint8, pairs map[string]string) error {
 func (c *Client) DoRequest(ctx context.Context, params map[string]string, body io.Reader) (*http.Response, error) {
 	// Check if context is already cancelled
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("context error: %w", err)
+		return nil, wrap(err, ErrContextCancelled, "context error")
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, errors.New("client closed")
+		return nil, ErrClientClosed
 	}
 	c.mu.Unlock()
 
@@ -135,7 +160,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 	deadline, ok := ctx.Deadline()
 	if ok {
 		if err := c.conn.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting deadline: %w", err)
+			return nil, wrap(err, ErrWrite, "setting deadline")
 		}
 		// Reset deadline after request
 		defer c.conn.SetDeadline(time.Time{})
@@ -143,34 +168,34 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 
 	// BEGIN_REQUEST record
 	if err := c.writeBeginRequest(uint16(fcgiResponder), 0); err != nil {
-		return nil, fmt.Errorf("writing begin request: %w", err)
+		return nil, wrap(err, ErrWrite, "writing begin request")
 	}
 
 	// Check context after each major operation
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("context error: %w", err)
+		return nil, wrap(err, ErrContextCancelled, "context error")
 	}
 
 	// PARAMS records
 	if err := c.writePairs(fcgiParams, params); err != nil {
-		return nil, fmt.Errorf("writing params: %w", err)
+		return nil, wrap(err, ErrWrite, "writing params")
 	}
 
 	// Send terminating empty PARAMS record
 	if err := c.writeRecord(fcgiParams, nil); err != nil {
-		return nil, fmt.Errorf("writing empty params: %w", err)
+		return nil, wrap(err, ErrWrite, "writing empty params")
 	}
 
 	// Check context after params
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("context error: %w", err)
+		return nil, wrap(err, ErrContextCancelled, "context error")
 	}
 
 	// STDIN records
 	if body != nil {
 		bodyBuf := &bytes.Buffer{}
 		if _, err := io.Copy(bodyBuf, body); err != nil {
-			return nil, fmt.Errorf("reading request body: %w", err)
+			return nil, wrap(err, ErrRead, "reading request body")
 		}
 		data := bodyBuf.Bytes()
 
@@ -179,7 +204,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 		for offset < total {
 			// Check context before each chunk
 			if err := ctx.Err(); err != nil {
-				return nil, fmt.Errorf("context error: %w", err)
+				return nil, wrap(err, ErrContextCancelled, "context error")
 			}
 
 			chunkSize := total - offset
@@ -188,7 +213,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 			}
 			chunk := data[offset : offset+chunkSize]
 			if err := c.writeRecord(fcgiStdin, chunk); err != nil {
-				return nil, fmt.Errorf("writing stdin chunk: %w", err)
+				return nil, wrap(err, ErrWrite, "writing stdin chunk")
 			}
 			offset += chunkSize
 		}
@@ -196,7 +221,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 
 	// Always send terminating empty STDIN record
 	if err := c.writeRecord(fcgiStdin, nil); err != nil {
-		return nil, fmt.Errorf("writing empty stdin: %w", err)
+		return nil, wrap(err, ErrWrite, "writing empty stdin")
 	}
 
 	// Read response
@@ -206,57 +231,57 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 	for {
 		// Check context before each read
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("context error: %w", err)
+			return nil, wrap(err, ErrContextCancelled, "context error")
 		}
 
 		h := header{}
 		if err := binary.Read(c.conn, binary.BigEndian, &h); err != nil {
-			if err == io.EOF {
+			if isEOF(err) {
 				if respBuf.Len() > 0 && endRequestReceived {
 					break
 				}
-				return nil, fmt.Errorf("unexpected EOF while reading header")
+				return nil, wrap(err, ErrUnexpectedEOF, "unexpected EOF while reading header")
 			}
-			if err, ok := err.(net.Error); ok && err.Timeout() {
-				return nil, fmt.Errorf("timeout while reading header: %w", err)
+			if isTimeout(err) {
+				return nil, wrap(err, ErrTimeout, "timeout while reading header")
 			}
-			return nil, fmt.Errorf("reading response header: %w", err)
+			return nil, wrap(err, ErrRead, "reading response header")
 		}
 
 		if h.Type == fcgiStdout || h.Type == fcgiStderr {
 			b := make([]byte, h.ContentLength)
 			if _, err := io.ReadFull(c.conn, b); err != nil {
-				if err, ok := err.(net.Error); ok && err.Timeout() {
-					return nil, fmt.Errorf("timeout while reading response body: %w", err)
+				if isTimeout(err) {
+					return nil, wrap(err, ErrTimeout, "timeout while reading response body")
 				}
-				return nil, fmt.Errorf("reading response body: %w", err)
+				return nil, wrap(err, ErrRead, "reading response body")
 			}
 			respBuf.Write(b)
 
 			if h.PaddingLength > 0 {
 				if _, err := io.CopyN(io.Discard, c.conn, int64(h.PaddingLength)); err != nil {
-					if err, ok := err.(net.Error); ok && err.Timeout() {
-						return nil, fmt.Errorf("timeout while reading padding: %w", err)
+					if isTimeout(err) {
+						return nil, wrap(err, ErrTimeout, "timeout while reading padding")
 					}
-					return nil, fmt.Errorf("reading padding: %w", err)
+					return nil, wrap(err, ErrRead, "reading padding")
 				}
 			}
 		} else if h.Type == fcgiEndRequest {
 			endRequestReceived = true
 			if h.ContentLength > 0 {
 				if _, err := io.CopyN(io.Discard, c.conn, int64(h.ContentLength)); err != nil {
-					if err, ok := err.(net.Error); ok && err.Timeout() {
-						return nil, fmt.Errorf("timeout while reading end request body: %w", err)
+					if isTimeout(err) {
+						return nil, wrap(err, ErrTimeout, "timeout while reading end request body")
 					}
-					return nil, fmt.Errorf("reading end request body: %w", err)
+					return nil, wrap(err, ErrRead, "reading end request body")
 				}
 			}
 			if h.PaddingLength > 0 {
 				if _, err := io.CopyN(io.Discard, c.conn, int64(h.PaddingLength)); err != nil {
-					if err, ok := err.(net.Error); ok && err.Timeout() {
-						return nil, fmt.Errorf("timeout while reading end request padding: %w", err)
+					if isTimeout(err) {
+						return nil, wrap(err, ErrTimeout, "timeout while reading end request padding")
 					}
-					return nil, fmt.Errorf("reading end request padding: %w", err)
+					return nil, wrap(err, ErrRead, "reading end request padding")
 				}
 			}
 			if respBuf.Len() > 0 {
@@ -267,7 +292,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 
 	resp, err := parseHTTPResponse(respBuf)
 	if err != nil {
-		return nil, fmt.Errorf("parsing HTTP response: %w", err)
+		return nil, wrap(err, ErrInvalidResponse, "parsing HTTP response")
 	}
 	return resp, nil
 }
@@ -278,8 +303,8 @@ func parseHTTPResponse(buf *bytes.Buffer) (*http.Response, error) {
 
 	line, err := tp.ReadLine()
 	if err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
+		if isEOF(err) {
+			err = ErrUnexpectedEOF
 		}
 		return nil, err
 	}
@@ -300,7 +325,7 @@ func parseHTTPResponse(buf *bytes.Buffer) (*http.Response, error) {
 		line = "HTTP/1.1 " + strings.TrimPrefix(line, "Status: ")
 	}
 	if i := strings.IndexByte(line, ' '); i == -1 {
-		return nil, fmt.Errorf("malformed HTTP response %q", line)
+		return nil, wrap(fmt.Errorf("malformed HTTP response %q", line), ErrInvalidResponse, "malformed HTTP response")
 	} else {
 		resp := new(http.Response)
 		resp.Proto = line[:i]
@@ -311,23 +336,23 @@ func parseHTTPResponse(buf *bytes.Buffer) (*http.Response, error) {
 			statusCode = resp.Status[:i]
 		}
 		if len(statusCode) != 3 {
-			return nil, fmt.Errorf("malformed HTTP status code %q", statusCode)
+			return nil, wrap(fmt.Errorf("malformed HTTP status code %q", statusCode), ErrInvalidResponse, "malformed HTTP status code")
 		}
 		resp.StatusCode, err = strconv.Atoi(statusCode)
 		if err != nil || resp.StatusCode < 0 {
-			return nil, fmt.Errorf("invalid HTTP status code %q", statusCode)
+			return nil, wrap(fmt.Errorf("invalid HTTP status code %q", statusCode), ErrInvalidResponse, "invalid HTTP status code")
 		}
 
 		var ok bool
 		if resp.ProtoMajor, resp.ProtoMinor, ok = http.ParseHTTPVersion(resp.Proto); !ok {
-			return nil, fmt.Errorf("malformed HTTP version %q", resp.Proto)
+			return nil, wrap(fmt.Errorf("malformed HTTP version %q", resp.Proto), ErrInvalidResponse, "malformed HTTP version")
 		}
 
 		// Headers
 		mimeHeader, err := tp.ReadMIMEHeader()
 		if err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
+			if isEOF(err) {
+				err = ErrUnexpectedEOF
 			}
 			return nil, err
 		}
@@ -386,7 +411,7 @@ func Dial(network, address string) (*Client, error) {
 	}
 	conn, err := dialer.Dial(network, address)
 	if err != nil {
-		return nil, err
+		return nil, wrap(err, ErrConnect, "dialing connection")
 	}
 	return &Client{conn: conn, reqID: 1}, nil
 }
@@ -397,7 +422,7 @@ func DialContext(ctx context.Context, network, address string) (*Client, error) 
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
-		return nil, err
+		return nil, wrap(err, ErrConnect, "dialing connection with context")
 	}
 	return &Client{conn: conn, reqID: 1}, nil
 }

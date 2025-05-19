@@ -2,6 +2,7 @@ package fcgx
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -196,8 +197,8 @@ func TestFCGXIntegration(t *testing.T) {
 			_, err = io.ReadAll(resp.Body)
 			if err == nil {
 				t.Log("No error: operation completed before context expired")
-			} else if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "operation was canceled") {
-				t.Errorf("Expected context cancelled error, got: %v", err)
+			} else if !errors.Is(err, ErrContextCancelled) && !errors.Is(err, ErrTimeout) {
+				t.Errorf("Expected context cancelled or timeout error, got: %v", err)
 			}
 		})
 	})
