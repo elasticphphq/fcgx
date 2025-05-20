@@ -309,16 +309,37 @@ func parseHTTPResponse(buf *bytes.Buffer) (*http.Response, error) {
 		}
 		return nil, err
 	}
-	// If missing HTTP headers, fallback to plain-text body
+	// If missing HTTP headers, fallback to plain-text body, but parse simple MIME headers if present
 	if !strings.HasPrefix(line, "HTTP/") && !strings.HasPrefix(line, "Status:") {
+		// Attempt to parse MIME headers if present
+		headers := http.Header{}
+		if strings.Contains(line, ":") {
+			headersParts := []string{line}
+			for {
+				hline, err := tp.ReadLine()
+				if err != nil {
+					break
+				}
+				if hline == "" {
+					break
+				}
+				headersParts = append(headersParts, hline)
+			}
+			for _, h := range headersParts {
+				if parts := strings.SplitN(h, ":", 2); len(parts) == 2 {
+					headers.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+				}
+			}
+		}
+
 		return &http.Response{
 			Status:     "200 OK",
 			StatusCode: 200,
 			Proto:      "HTTP/1.1",
 			ProtoMajor: 1,
 			ProtoMinor: 1,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(io.MultiReader(strings.NewReader(line+"\n"), reader)),
+			Header:     headers,
+			Body:       io.NopCloser(reader),
 		}, nil
 	}
 	// Handle status lines without protocol, e.g., "Status: 200 OK"

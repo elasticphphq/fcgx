@@ -1,8 +1,10 @@
 package fcgx
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -390,6 +392,27 @@ func TestFCGXIntegration(t *testing.T) {
 				}
 			case <-readCtx.Done():
 				t.Log("Context deadline exceeded: operation timed out as expected")
+			}
+		})
+
+		t.Run("ParseFallbackWithOnlyContentType", func(t *testing.T) {
+			body := "Content-Type: application/json\r\n\r\n{\"status\":\"ok\",\"pass\":true}"
+			resp, err := parseHTTPResponse(bytes.NewBufferString(body))
+			if err != nil {
+				t.Fatalf("parseHTTPResponse failed: %v", err)
+			}
+			if resp.StatusCode != 200 {
+				t.Errorf("Expected status code 200, got %d", resp.StatusCode)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Expected Content-Type header, got: %s", ct)
+			}
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Failed to read response body: %v", err)
+			}
+			if !strings.Contains(string(b), `"status":"ok"`) {
+				t.Errorf("Expected JSON body, got: %s", string(b))
 			}
 		})
 	})
